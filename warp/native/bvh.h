@@ -22,7 +22,7 @@
 #include "intersect.h"
 
 #ifdef __CUDA_ARCH__
-#define BVH_SHARED_STACK 1
+#define BVH_SHARED_STACK 0
 #else
 #define BVH_SHARED_STACK 0
 #endif
@@ -355,7 +355,9 @@ struct bvh_stack_t {
 struct bvh_query_t {
     CUDA_CALLABLE bvh_query_t()
         : bvh()
+#if BVH_SHARED_STACK
         , stack()
+#endif
         , count(0)
         , is_ray(false)
         , input_lower()
