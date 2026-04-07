@@ -563,10 +563,16 @@ class Geometry:
                                 continue
 
                         coords, dist = self.cell_closest_point(args, cell_index, pos)
+                        # Workaround for MetaX compiler bug: reading vec3 components
+                        # inside a predicated (if) block causes partial writes.
+                        # Force materialization of all components before the conditional.
+                        c0 = coords[0]
+                        c1 = coords[1]
+                        c2 = coords[2]
                         if dist <= closest_dist:
                             closest_dist = dist
                             closest_cell = cell_index
-                            closest_coords = coords
+                            closest_coords = Coords(c0, c1, c2)
 
                     if pad >= _BVH_MAX_PADDING:
                         break
