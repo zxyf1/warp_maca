@@ -563,16 +563,20 @@ class Geometry:
                                 continue
 
                         coords, dist = self.cell_closest_point(args, cell_index, pos)
-                        # Workaround for MetaX compiler bug: reading vec3 components
-                        # inside a predicated (if) block causes partial writes.
-                        # Force materialization of all components before the conditional.
-                        c0 = coords[0]
-                        c1 = coords[1]
-                        c2 = coords[2]
-                        if dist <= closest_dist:
-                            closest_dist = dist
-                            closest_cell = cell_index
-                            closest_coords = Coords(c0, c1, c2)
+                        # Workaround for MetaX compiler bug:
+                        # Any read/write inside an `if` block (predicated region)
+                        # is incorrectly compiled — some vec3 component writes are
+                        # skipped. Compiler also sinks pre-reads back into the block.
+                        # Fix: use wp.where (compiles to PTX `selp`, not predicated
+                        # movs) so all reads happen unconditionally before selection.
+                        is_closer = dist <= closest_dist
+                        closest_dist = wp.where(is_closer, dist, closest_dist)
+                        closest_cell = wp.where(is_closer, cell_index, closest_cell)
+                        closest_coords = Coords(
+                            wp.where(is_closer, coords[0], closest_coords[0]),
+                            wp.where(is_closer, coords[1], closest_coords[1]),
+                            wp.where(is_closer, coords[2], closest_coords[2]),
+                        )
 
                     if pad >= _BVH_MAX_PADDING:
                         break
