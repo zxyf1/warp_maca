@@ -2305,9 +2305,7 @@ mesh_query_inside_parity(uint64_t id, const vec3& p, const vec3 base_dir, int n_
 struct mesh_query_aabb_t {
     CUDA_CALLABLE mesh_query_aabb_t()
         : mesh()
-#if BVH_SHARED_STACK
         , stack()
-#endif
         , count(0)
         , input_lower()
         , input_upper()
