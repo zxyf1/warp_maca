@@ -11,16 +11,13 @@
 #  repro_nvrtc   : nvcc host + NVRTC JIT (bug reproduces on MetaX via NVRTC)
 #
 # ── Usage (repro_nvrtc) ───────────────────────────────────────────────────────
-#  make repro_nvrtc WARP_NATIVE=/path/to/warp_maca/warp/native
-#  ./repro_nvrtc /path/to/warp_maca/warp/native           # run repro
-#  ./repro_nvrtc /path/to/warp_maca/warp/native --dump-bc # dump .bc (NVIDIA only)
+#  make repro_nvrtc
+#  ./repro_nvrtc               # run repro (no arguments needed)
+#  ./repro_nvrtc --dump-bc     # also dump cell_lookup.bc (NVIDIA only)
 
 NVCC          ?= nvcc
 ARCH          ?= sm_80
 NVCCFLAGS     ?= -O2 -g -arch=$(ARCH)
-
-# Path to warp/native headers (passed to NVRTC at runtime, not at compile time)
-WARP_NATIVE   ?= ../warp/native
 
 TARGET        = cell_lookup
 NVRTC_TARGET  = repro_nvrtc
@@ -39,10 +36,10 @@ run: $(TARGET)
 	./$(TARGET)
 
 run_nvrtc: $(NVRTC_TARGET)
-	./$(NVRTC_TARGET) $(WARP_NATIVE)
+	./$(NVRTC_TARGET)
 
 run_nvrtc_dump_bc: $(NVRTC_TARGET)
-	./$(NVRTC_TARGET) $(WARP_NATIVE) --dump-bc
+	./$(NVRTC_TARGET) --dump-bc
 
 clean:
 	rm -f $(TARGET) $(NVRTC_TARGET) cell_lookup.bc

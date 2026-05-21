@@ -4,19 +4,20 @@
  * Compile (offline with nvcc — offline compiler has no bug):
  *   nvcc -O2 repro_nvrtc.cu -lcuda -lnvrtc -o repro_nvrtc
  *
- * Run (pass the path to warp/native headers as argv[1]):
- *   ./repro_nvrtc /path/to/warp_maca/warp/native
- *   ./repro_nvrtc /path/to/warp_maca/warp/native --dump-bc   # NVIDIA only
+ * Run:
+ *   ./repro_nvrtc
+ *   ./repro_nvrtc --dump-bc   # also write cell_lookup.bc (NVIDIA only)
  *
  * How it works:
  *   The buggy and fixed device kernels live in the KERNEL_SRC string below.
  *   They are JIT-compiled at runtime via the NVRTC C API — the exact same
  *   compiler path that Warp uses — which is where MetaX has the bug.
  *   The offline nvcc compilation of this host file does NOT trigger the bug.
+ *   All BVH types and traversal code are inlined in KERNEL_SRC; no external
+ *   headers are needed at runtime.
  *
  * Dependencies: CUDA SDK only (cuda.h, nvrtc.h, cuda_runtime.h).
- *   warp/native/ headers are required only for NVRTC at runtime (via -I flag).
- *   No Warp Python runtime needed.
+ *   No Warp Python runtime needed. No warp/native headers needed.
  *
  * Bug explanation:
  *   bvh_query_t (BVH traversal state) contains a shared-memory stack pointer,
@@ -289,28 +290,159 @@ static void build_aabb(const float2* pos, const int3* tri, int n,
 
 /* ── Device kernel source ───────────────────────────────────────────────────── */
 /*
- * This string is compiled at runtime by NVRTC (the JIT path).
- * Requires: -I /path/to/warp_maca/warp/native   (for bvh.h and its deps)
+ * Self-contained: all BVH types and traversal code are inlined here.
+ * Extracted from warp/native/bvh.h + intersect.h.  No external headers needed.
+ * Uses float2 / float3 / int3 (CUDA built-ins, same layout as wp::vec2/3/3i).
  *
  * BUG LOCATION (cell_lookup_buggy):
- *   After tri_closest(), the block:
+ *   After tri_closest_2d(), the block:
  *       if (dist <= closest_dist) { closest_coords = coords; }
- *   causes NVRTC to generate predicated writes (@p mov.f32) for each of the
- *   three components of closest_coords.  On MetaX, these predicated writes are
- *   incorrectly skipped even when the predicate is TRUE, so closest_coords
- *   stays at the sentinel value (-1e8, -1e8, -1e8).
+ *   causes NVRTC to generate @p mov.f32 for each of the 3 float components.
+ *   On MetaX the predicated write is incorrectly discarded even when TRUE.
  *
  * FIX (cell_lookup_fixed):
- *   Ternary ? : per component → PTX selp.f32 (unconditional select).
- *   No predicated block is emitted.
+ *   Ternary ? : per component → PTX selp.f32 (unconditional select, no bug).
  */
 static const char KERNEL_SRC[] = R"KERNEL(
-#include "bvh.h"
+/* ══ BVH types and traversal — inlined from warp/native/bvh.h ═══════════════
+   Layout of BVH / BVHPackedNodeHalf must match warp/native/bvh.h exactly so
+   that the device pointer uploaded by the host (HostBVH struct) is valid.    */
 
-using namespace wp;
+#define BVH_QUERY_STACK_SIZE 32
+#define WP_TILE_BLOCK_DIM    256
 
-/* ── 2D geometry: project query point onto triangle ──────────────────────────
-   Direct translation of project_on_tri_at_origin from closest_point.py.    */
+struct BVHPackedNodeHalf {
+    float        x, y, z;
+    unsigned int i : 31;   /* left-child index (internal) or range start (leaf) */
+    unsigned int b : 1;    /* 1 = leaf node */
+};
+
+/* Same field order/types as wp::BVH in bvh.h (104 bytes on 64-bit) */
+struct BVH {
+    BVHPackedNodeHalf* node_lowers;
+    BVHPackedNodeHalf* node_uppers;
+    int*               node_parents;
+    int*               node_counts;
+    int*               primitive_indices;
+    int max_depth, max_nodes, num_nodes, num_leaf_nodes;
+    int*    root;
+    float3* item_lowers;    /* wp::vec3 has identical memory layout to float3 */
+    float3* item_uppers;
+    int*    item_groups;
+    int     num_items, leaf_size;
+    void*   context;
+};
+
+/* Strided shared-memory stack (one slot per depth per thread) */
+struct bvh_stack_t {
+    __device__ inline int  operator[](int d) const { return ptr[d * WP_TILE_BLOCK_DIM]; }
+    __device__ inline int& operator[](int d)       { return ptr[d * WP_TILE_BLOCK_DIM]; }
+    int* ptr;
+};
+
+/* Per-thread traversal state — large struct = high register pressure */
+struct bvh_query_t {
+    __device__ bvh_query_t()
+        : count(0), primitive_counter(0), bounds_nr(-1), is_ray(false)
+    { input_lower = make_float3(0,0,0); input_upper = make_float3(0,0,0); }
+    __device__ bvh_query_t& operator+=(const bvh_query_t&) { return *this; }
+
+    BVH         bvh;         /* copy of BVH struct: many pointer+int fields */
+    bvh_stack_t stack;       /* ptr into shared memory */
+    int         count;
+    int         primitive_counter;
+    float3      input_lower;
+    float3      input_upper;
+    int         bounds_nr;
+    bool        is_ray;
+};
+
+__device__ inline BVH bvh_get(unsigned long long id)
+{
+    return *(BVH*)(id);
+}
+
+/* Texture-cache load: BVHPackedNodeHalf is 16 bytes = float4 */
+__device__ inline BVHPackedNodeHalf bvh_load_node(const BVHPackedNodeHalf* p, int i)
+{
+    float4 f = __ldg((const float4*)p + i);
+    return (const BVHPackedNodeHalf&)f;
+}
+
+__device__ inline bool aabb_overlap(float3 lo_a, float3 hi_a,
+                                     float3 lo_b, float3 hi_b)
+{
+    return !(lo_a.x > hi_b.x || hi_a.x < lo_b.x ||
+             lo_a.y > hi_b.y || hi_a.y < lo_b.y ||
+             lo_a.z > hi_b.z || hi_a.z < lo_b.z);
+}
+
+__device__ inline bvh_query_t bvh_query_aabb(unsigned long long id,
+                                              float3 lower, float3 upper)
+{
+    bvh_query_t q;
+    /* Static shared memory for the traversal stack.
+       Sized for BVH_QUERY_STACK_SIZE × WP_TILE_BLOCK_DIM = 32 KB.
+       Each thread uses its own strided slice via threadIdx.x.               */
+    __shared__ int _stack[BVH_QUERY_STACK_SIZE * WP_TILE_BLOCK_DIM];
+    q.stack.ptr       = &_stack[threadIdx.x];
+    q.bvh             = bvh_get(id);
+    q.input_lower     = lower;
+    q.input_upper     = upper;
+    q.is_ray          = false;
+    q.stack[0]        = *q.bvh.root;
+    q.count           = 1;
+    q.primitive_counter = 0;
+    q.bounds_nr       = -1;
+    return q;
+}
+
+__device__ inline bool bvh_query_next(bvh_query_t& q, int& index)
+{
+    BVH bvh = q.bvh;
+    while (q.count) {
+        int ni = q.stack[--q.count];
+        BVHPackedNodeHalf nl = bvh_load_node(bvh.node_lowers, ni);
+        BVHPackedNodeHalf nu = bvh_load_node(bvh.node_uppers, ni);
+
+        if (q.primitive_counter == 0) {   /* node-level AABB test */
+            if (!aabb_overlap(q.input_lower, q.input_upper,
+                              make_float3(nl.x, nl.y, nl.z),
+                              make_float3(nu.x, nu.y, nu.z)))
+                continue;
+        }
+
+        if (nl.b) {                              /* leaf */
+            int start = (int)nl.i, end = (int)nu.i;
+            if (end - start == 1) {              /* fast path: single prim */
+                index = bvh.primitive_indices[start];
+                q.bounds_nr = index;
+                q.primitive_counter = 0;
+                return true;
+            }
+            /* multi-prim leaf: one primitive per call */
+            int prim = bvh.primitive_indices[start + q.primitive_counter++];
+            if (start + q.primitive_counter == end)
+                q.primitive_counter = 0;
+            else
+                q.stack[q.count++] = ni;
+            if (!aabb_overlap(q.input_lower, q.input_upper,
+                              bvh.item_lowers[prim], bvh.item_uppers[prim]))
+                continue;
+            index = prim;
+            q.bounds_nr = prim;
+            return true;
+        } else {                                 /* internal node */
+            q.primitive_counter = 0;
+            q.stack[q.count++] = (int)nl.i;     /* left child  */
+            q.stack[q.count++] = (int)nu.i;     /* right child */
+        }
+    }
+    return false;
+}
+
+/* ══ 2D geometry ═════════════════════════════════════════════════════════════
+   Direct translation of project_on_tri_at_origin from closest_point.py      */
 
 __device__ static float2 seg_closest_2d(float2 q, float2 seg, float len_sq,
                                          float& out_t)
@@ -321,7 +453,7 @@ __device__ static float2 seg_closest_2d(float2 q, float2 seg, float len_sq,
 }
 
 __device__ static void tri_closest_2d(float2 q, float2 e1, float2 e2,
-                                       float& out_dist, vec3& out_coords)
+                                       float& out_dist, float3& out_coords)
 {
     float e1e1 = e1.x*e1.x + e1.y*e1.y;
     float e1e2 = e1.x*e2.x + e1.y*e2.y;
@@ -337,7 +469,7 @@ __device__ static void tri_closest_2d(float2 q, float2 e1, float2 e2,
             float dx = q.x - s*e1.x - t*e2.x;
             float dy = q.y - s*e1.y - t*e2.y;
             out_dist   = dx*dx + dy*dy;
-            out_coords = vec3(1.f - s - t, s, t);
+            out_coords = make_float3(1.f-s-t, s, t);
             return;
         }
     }
@@ -345,77 +477,68 @@ __device__ static void tri_closest_2d(float2 q, float2 e1, float2 e2,
     float t1, t2, t12;
     float2 r1  = seg_closest_2d(q,  e1, e1e1, t1);
     float2 r2  = seg_closest_2d(q,  e2, e2e2, t2);
-    float2 e12 = make_float2(e2.x - e1.x, e2.y - e1.y);
-    float2 qe1 = make_float2(q.x  - e1.x, q.y  - e1.y);
+    float2 e12 = make_float2(e2.x-e1.x, e2.y-e1.y);
     float  e12e12 = e12.x*e12.x + e12.y*e12.y;
-    float2 r12 = seg_closest_2d(qe1, e12, e12e12, t12);
+    float2 r12 = seg_closest_2d(make_float2(q.x-e1.x, q.y-e1.y),
+                                 e12, e12e12, t12);
 
-    float d1  = r1.x*r1.x   + r1.y*r1.y;
-    float d2  = r2.x*r2.x   + r2.y*r2.y;
+    float d1  = r1.x*r1.x  + r1.y*r1.y;
+    float d2  = r2.x*r2.x  + r2.y*r2.y;
     float d12 = r12.x*r12.x + r12.y*r12.y;
 
     if (d1 <= d2) {
-        if (d1 <= d12) { out_dist = d1;  out_coords = vec3(1.f-t1, t1, 0.f); return; }
+        if (d1 <= d12) { out_dist = d1;  out_coords = make_float3(1.f-t1, t1, 0.f); return; }
     } else if (d2 <= d12) {
-        out_dist = d2;  out_coords = vec3(1.f-t2, 0.f, t2); return;
+        out_dist = d2;  out_coords = make_float3(1.f-t2, 0.f, t2); return;
     }
-    out_dist = d12; out_coords = vec3(0.f, 1.f-t12, t12);
+    out_dist = d12; out_coords = make_float3(0.f, 1.f-t12, t12);
 }
 
-/* ── Buggy kernel ────────────────────────────────────────────────────────────
-   Mirrors make_filtered_cell_lookup in geometry.py BEFORE the wp.where fix.
-
-   `if (dist <= closest_dist) { closest_coords = coords; }`
-   → NVRTC generates @p mov.f32 for each of the 3 components (predicated write)
-   → MetaX incorrectly discards the write even when predicate is TRUE           */
+/* ══ Buggy kernel ════════════════════════════════════════════════════════════
+   if (dist <= closest_dist) { closest_coords = coords; }
+   → NVRTC code-sinks closest_coords read into the if block (register pressure
+     from bvh_query_t), then emits @p mov.f32 for each component.
+   → MetaX incorrectly discards the write even when predicate is TRUE.        */
 
 extern "C" __global__ void cell_lookup_buggy(
-    uint64_t        bvh_id,
-    const float2*   positions,
-    const vec3i*    tri_indices,
-    const float2*   query_pos,
-    int*            out_cell,
-    vec3*           out_coords,
-    int             n)
+    unsigned long long bvh_id,
+    const float2*      positions,
+    const int3*        tri_indices,
+    const float2*      query_pos,
+    int*               out_cell,
+    float3*            out_coords,
+    int                n)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 
     float2 pos          = query_pos[i];
     int    closest_cell = -1;
-    vec3   closest_coords(-1.e8f, -1.e8f, -1.e8f);   /* OUTSIDE sentinel */
+    float3 closest_coords = make_float3(-1.e8f, -1.e8f, -1.e8f);
     float  pad          = 1.e-5f;
 
-    /* Outer loop: expand AABB pad until a cell is found (mirrors geometry.py) */
     while (closest_cell == -1) {
         float closest_dist = pad * pad;
 
-        bvh_query_t query = bvh_query_aabb(
-            bvh_id,
-            vec3(pos.x - pad, pos.y - pad, -pad),
-            vec3(pos.x + pad, pos.y + pad,  pad),
-            -1);
+        bvh_query_t query = bvh_query_aabb(bvh_id,
+            make_float3(pos.x - pad, pos.y - pad, -pad),
+            make_float3(pos.x + pad, pos.y + pad,  pad));
         int cell_index = 0;
 
-        /* Inner loop: BVH traversal — same structure as geometry.py */
-        while (bvh_query_next(query, cell_index, float(FLT_MAX))) {
-            vec3i  vidx = tri_indices[cell_index];
-            float2 p0   = positions[vidx[0]];
-            float2 p1   = positions[vidx[1]];
-            float2 p2   = positions[vidx[2]];
+        while (bvh_query_next(query, cell_index)) {
+            int3   vidx = tri_indices[cell_index];
+            float2 p0   = positions[vidx.x];
+            float2 p1   = positions[vidx.y];
+            float2 p2   = positions[vidx.z];
 
             float2 q  = make_float2(pos.x - p0.x, pos.y - p0.y);
             float2 e1 = make_float2(p1.x  - p0.x, p1.y  - p0.y);
             float2 e2 = make_float2(p2.x  - p0.x, p2.y  - p0.y);
 
-            float dist; vec3 coords;
+            float  dist; float3 coords;
             tri_closest_2d(q, e1, e2, dist, coords);
 
-            /* BUG TARGET: MetaX NVRTC incorrectly handles the predicated
-               write to closest_coords inside this if block.
-               NVRTC code-sinks the closest_coords read here under register
-               pressure from bvh_query_t, then emits @p mov.f32 for each
-               component — but the write is silently discarded on MetaX.     */
+            /* BUG: @p mov.f32 per component; MetaX discards when predicate TRUE */
             if (dist <= closest_dist) {
                 closest_dist   = dist;
                 closest_cell   = cell_index;
@@ -431,62 +554,55 @@ extern "C" __global__ void cell_lookup_buggy(
     out_coords[i] = closest_coords;
 }
 
-/* ── Fixed kernel ────────────────────────────────────────────────────────────
-   Mirrors make_filtered_cell_lookup from geometry.py AFTER the wp.where fix.
-
-   Ternary ? : per component → PTX selp.f32 (unconditional select).
-   selp reads both operands before choosing — no predicated block is emitted.  */
+/* ══ Fixed kernel ═════════════════════════════════════════════════════════════
+   Ternary ? : per component → PTX selp.f32 (unconditional select, no bug).   */
 
 extern "C" __global__ void cell_lookup_fixed(
-    uint64_t        bvh_id,
-    const float2*   positions,
-    const vec3i*    tri_indices,
-    const float2*   query_pos,
-    int*            out_cell,
-    vec3*           out_coords,
-    int             n)
+    unsigned long long bvh_id,
+    const float2*      positions,
+    const int3*        tri_indices,
+    const float2*      query_pos,
+    int*               out_cell,
+    float3*            out_coords,
+    int                n)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 
     float2 pos          = query_pos[i];
     int    closest_cell = -1;
-    vec3   closest_coords(-1.e8f, -1.e8f, -1.e8f);
+    float3 closest_coords = make_float3(-1.e8f, -1.e8f, -1.e8f);
     float  pad          = 1.e-5f;
 
     while (closest_cell == -1) {
         float closest_dist = pad * pad;
 
-        bvh_query_t query = bvh_query_aabb(
-            bvh_id,
-            vec3(pos.x - pad, pos.y - pad, -pad),
-            vec3(pos.x + pad, pos.y + pad,  pad),
-            -1);
+        bvh_query_t query = bvh_query_aabb(bvh_id,
+            make_float3(pos.x - pad, pos.y - pad, -pad),
+            make_float3(pos.x + pad, pos.y + pad,  pad));
         int cell_index = 0;
 
-        while (bvh_query_next(query, cell_index, float(FLT_MAX))) {
-            vec3i  vidx = tri_indices[cell_index];
-            float2 p0   = positions[vidx[0]];
-            float2 p1   = positions[vidx[1]];
-            float2 p2   = positions[vidx[2]];
+        while (bvh_query_next(query, cell_index)) {
+            int3   vidx = tri_indices[cell_index];
+            float2 p0   = positions[vidx.x];
+            float2 p1   = positions[vidx.y];
+            float2 p2   = positions[vidx.z];
 
             float2 q  = make_float2(pos.x - p0.x, pos.y - p0.y);
             float2 e1 = make_float2(p1.x  - p0.x, p1.y  - p0.y);
             float2 e2 = make_float2(p2.x  - p0.x, p2.y  - p0.y);
 
-            float dist; vec3 coords;
+            float  dist; float3 coords;
             tri_closest_2d(q, e1, e2, dist, coords);
 
-            /* FIX: ternary per component → selp.f32 in PTX.
-               Equivalent to wp.where(is_closer, coords[k], closest_coords[k])
-               for k = 0,1,2.  No predicated block; no MetaX bug.            */
+            /* FIX: selp.f32 per component — unconditional, no predicated block */
             int closer     = (dist <= closest_dist);
             closest_dist   = closer ? dist       : closest_dist;
             closest_cell   = closer ? cell_index : closest_cell;
-            closest_coords = vec3(
-                closer ? coords[0] : closest_coords[0],
-                closer ? coords[1] : closest_coords[1],
-                closer ? coords[2] : closest_coords[2]);
+            closest_coords = make_float3(
+                closer ? coords.x : closest_coords.x,
+                closer ? coords.y : closest_coords.y,
+                closer ? coords.z : closest_coords.z);
         }
 
         if (pad >= 1.e6f) break;
@@ -500,21 +616,14 @@ extern "C" __global__ void cell_lookup_fixed(
 
 /* ── NVRTC compilation ──────────────────────────────────────────────────────── */
 
-static std::vector<char> compile_kernels(const char* warp_native_dir, bool dump_bc)
+static std::vector<char> compile_kernels(bool dump_bc)
 {
     nvrtcProgram prog;
     NVRTC_CHECK(nvrtcCreateProgram(&prog, KERNEL_SRC, "cell_lookup_kernel.cu",
                                    0, nullptr, nullptr));
 
-    char inc[2048];
-    snprintf(inc, sizeof(inc), "-I%s", warp_native_dir);
-
-    const char* opts[] = {
-        inc,
-        "-arch=compute_80",
-    };
-
-    nvrtcResult res = nvrtcCompileProgram(prog, 2, opts);
+    const char* opts[] = { "-arch=compute_80" };
+    nvrtcResult res = nvrtcCompileProgram(prog, 1, opts);
     if (res != NVRTC_SUCCESS) {
         size_t log_sz;
         nvrtcGetProgramLogSize(prog, &log_sz);
@@ -565,16 +674,7 @@ static float2 reconstruct(const float2* pos, const int3* tri, int cell,
 
 int main(int argc, char** argv)
 {
-    if (argc < 2) {
-        fprintf(stderr,
-            "Usage: %s <warp_native_dir> [--dump-bc]\n"
-            "  warp_native_dir: path to warp_maca/warp/native  (for bvh.h etc.)\n"
-            "  --dump-bc:       write cell_lookup.bc (NVIDIA only)\n",
-            argv[0]);
-        return 1;
-    }
-    const char* warp_native_dir = argv[1];
-    bool        dump_bc         = (argc >= 3 && strcmp(argv[2], "--dump-bc") == 0);
+    bool dump_bc = (argc >= 2 && strcmp(argv[1], "--dump-bc") == 0);
 
     /* ── Build mesh (CPU) ─────────────────────────────────────────────────── */
     float2 h_pos[N_VERTS];
@@ -620,8 +720,8 @@ int main(int argc, char** argv)
     CUDA_CHECK(cudaMemcpy(d_query, h_query, N_TRIS  * sizeof(float2), cudaMemcpyHostToDevice));
 
     /* ── NVRTC compile (triggers MetaX bug in the JIT path) ─────────────── */
-    printf("Compiling kernels via NVRTC with -I%s ...\n", warp_native_dir);
-    std::vector<char> ptx = compile_kernels(warp_native_dir, dump_bc);
+    printf("Compiling kernels via NVRTC...\n");
+    std::vector<char> ptx = compile_kernels(dump_bc);
     printf("NVRTC compilation OK (%zu bytes PTX).\n", ptx.size());
 
     /* ── Load PTX via CUDA driver API ────────────────────────────────────── */
